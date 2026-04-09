@@ -880,4 +880,34 @@ def maybe_fix_3d_position_ids(data: TensorDict):
     # will incur indexing error for ragged tensor. This only happens when using 3D position ids in VLMs.
     # This is likely a bug in tensordict. As a workaround, we manually set _ragged_index.
     if "position_ids" in data.keys() and data["position_ids"].dim() == 3 and data["position_ids"].is_nested:
-        data["position_ids"]._ragged_idx = 2
+        batch_num, rope_dim, seq_len = data["position_ids"].shape
+        if isinstance(seq_len, int):
+            offsets = data["position_ids"].offsets()
+            values = data["position_ids"].values()
+            offset_diffs = offsets.diff()
+            inferred_rope_dim = rope_dim if isinstance(rope_dim, int) else None
+            if values.dim() == 2 and values.shape[0] % batch_num == 0:
+                candidate_rope_dim = values.shape[0] // batch_num
+                if (
+                    offset_diffs.numel() == batch_num
+                    and torch.all(offset_diffs == candidate_rope_dim)
+                    and values.shape[1] == seq_len
+                ):
+                    inferred_rope_dim = candidate_rope_dim
+
+            broken_layout = inferred_rope_dim is not None and (
+                offset_diffs.numel() == batch_num
+                and torch.all(offset_diffs == inferred_rope_dim)
+                and values.dim() == 2
+                and values.shape[0] == batch_num * inferred_rope_dim
+                and values.shape[1] == seq_len
+            )
+            if broken_layout:
+                # In the broken equal-length case, offsets still has batch_num + 1 entries,
+                # so offsets length alone cannot tell whether the jagged layout is correct.
+                # offsets.shape: [wrong](0, rope_dim, 2 * rope_dim, ...) -> [correct](0, seq_len, 2 * seq_len, ...)
+                # values.shape : [wrong](batch_num * rope_dim, seq_len)  -> [correct](rope_dim, batch_num * seq_len)
+                offsets = torch.arange(0, (batch_num + 1) * seq_len, seq_len, dtype=offsets.dtype, device=values.device)
+                values = values.contiguous().view(batch_num, inferred_rope_dim, seq_len).transpose(0, 1).flatten(1)
+
+            data["position_ids"] = torch.nested.nested_tensor_from_jagged(values=values, offsets=offsets, jagged_dim=2)
