@@ -20,7 +20,7 @@ import os
 import re
 import warnings
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterable, Iterator, Optional
 
 import numpy as np
 import torch
@@ -281,6 +281,31 @@ def check_exclude_modules(config, key: str) -> bool:
         elif any(key.endswith(f".{exclude_key}") for exclude_key in config.exclude_modules):
             return True
     return False
+
+
+def split_fused_moe_experts(
+    weights: "Iterable[tuple[str, torch.Tensor]]",
+) -> "Iterator[tuple[str, torch.Tensor]]":
+    """Stream-split HF "native fused" MoE expert tensors into per-expert tensors."""
+    for name, tensor in weights:
+        if not isinstance(tensor, torch.Tensor) or tensor.dim() != 3:
+            yield name, tensor
+            continue
+
+        if name.endswith(".experts.gate_up_proj"):
+            base = name[: -len(".gate_up_proj")]
+            num_experts, two_inter, _hidden = tensor.shape
+            inter = two_inter // 2
+            for i in range(num_experts):
+                gate_up = tensor[i]
+                yield f"{base}.{i}.gate_proj.weight", gate_up[:inter].contiguous()
+                yield f"{base}.{i}.up_proj.weight", gate_up[inter:].contiguous()
+        elif name.endswith(".experts.down_proj"):
+            base = name[: -len(".down_proj")]
+            for i in range(tensor.shape[0]):
+                yield f"{base}.{i}.down_proj.weight", tensor[i].contiguous()
+        else:
+            yield name, tensor
 
 
 def check_target_modules(config, key: str) -> bool:
